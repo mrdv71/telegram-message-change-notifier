@@ -192,13 +192,21 @@ class MessageWatch:
 
     def install(self, client):
         self.client = client
+        # Sender lookups yield to the event loop. Serialize mutations so a
+        # slower original cannot overwrite a later edit or miss a deletion.
+        event_lock = asyncio.Lock()
         async def new(event):
-            await self.record(event)
+            async with event_lock:
+                await self.record(event)
         async def edit(event):
-            await self.record(event, edited=True)
+            async with event_lock:
+                await self.record(event, edited=True)
+        async def deleted(event):
+            async with event_lock:
+                await self.deleted(event)
         for callback, kind in [(new, events.NewMessage(incoming=True)),
                                (edit, events.MessageEdited(incoming=True)),
-                               (self.deleted, events.MessageDeleted())]:
+                               (deleted, events.MessageDeleted())]:
             client.add_event_handler(callback, kind)
             self.handlers.append(callback)
         with self.db:

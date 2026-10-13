@@ -92,4 +92,45 @@ class ExtraTests(unittest.IsolatedAsyncioTestCase):
         self.w = MessageWatch(self.path, 99, 'unused')
         self.assertEqual(self.w.db.execute('SELECT text FROM outbox').fetchall(), before)
 
+class OrderingTests(unittest.IsolatedAsyncioTestCase):
+    asyncSetUp = Tests.asyncSetUp
+    asyncTearDown = Tests.asyncTearDown
+
+    async def test_slow_original_then_edit_and_delete(self):
+        class Client:
+            def add_event_handler(self, callback, kind):
+                pass
+        worker = self.w.install(Client())
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        self.w.db.execute('DELETE FROM outbox')
+        self.w.db.commit()
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = Event(text='original', media=None)
+        async def slow_sender():
+            entered.set()
+            await release.wait()
+            return S(first_name='Test', bot=False)
+        original.get_sender = slow_sender
+        first = asyncio.create_task(self.w.handlers[0](original))
+        await entered.wait()
+        second = asyncio.create_task(self.w.handlers[1](Event(text='edited', media=None)))
+        third = asyncio.create_task(self.w.handlers[2](S(chat_id=None, deleted_ids=[1])))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, second, third)
+        self.assertEqual(self.w.db.execute('SELECT text,deleted FROM messages').fetchone(), ('edited', 1))
+        alerts = [r[0] for r in self.w.db.execute('SELECT text FROM outbox ORDER BY id')]
+        self.assertEqual(len(alerts), 2)
+        self.assertIn('original', alerts[0])
+        self.assertIn('edited', alerts[0])
+        self.assertIn('edited', alerts[1])
+
+    async def test_long_unicode_alert_is_split_without_loss(self):
+        body = '😀' * 5000
+        self.w.enqueue(body)
+        parts = [r[0] for r in self.w.db.execute('SELECT text FROM outbox ORDER BY id')]
+        self.assertEqual(''.join(parts), body)
+        self.assertTrue(all(len(p.encode('utf-16-le')) // 2 <= 4096 for p in parts))
+
 if __name__=='__main__':unittest.main()

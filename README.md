@@ -53,4 +53,4 @@ python -m unittest -v
 python notifier.py --help
 ```
 
-Tests use temporary databases and generated dummy media; they do not log in or send real Telegram messages. Live account capture, live bot delivery, reboot and sleep/wake behavior must be verified separately in your own setup.
+Tests include ordered overlapping arrival/edit/delete events and long Unicode notification splitting. Tests use temporary databases and generated dummy media; they do not log in or send real Telegram messages. Live account capture, live bot delivery, reboot and sleep/wake behavior must be verified separately in your own setup.

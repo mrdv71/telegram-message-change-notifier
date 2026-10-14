@@ -1,0 +1,17 @@
+[Unit]
+Description=telegram-message-change-notifier
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/apps/telegram-message-change-notifier
+ExecStart=%h/apps/telegram-message-change-notifier/.venv/bin/python -u %h/apps/telegram-message-change-notifier/notifier.py --state-dir %h/.local/share/telegram-message-change-notifier run
+Restart=always
+RestartSec=15
+KillSignal=SIGINT
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

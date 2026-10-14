@@ -12,7 +12,7 @@ STATE = Path(__file__).resolve().parent / "state"
 
 def state_dir():
     os.umask(0o077)
-    STATE.mkdir(mode=0o700, exist_ok=True)
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
     STATE.chmod(0o700)
 
 async def setup():
@@ -71,7 +71,10 @@ async def run():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Telegram private-chat edit/delete alerts")
     parser.add_argument("command", choices=["setup", "run"])
+    parser.add_argument("--state-dir", type=Path, default=STATE,
+                        help="Private persistent data directory (default: state/ beside notifier.py)")
     args = parser.parse_args()
+    STATE = args.state_dir.expanduser().resolve()
     try:
         asyncio.run(setup() if args.command == "setup" else run())
     except KeyboardInterrupt:

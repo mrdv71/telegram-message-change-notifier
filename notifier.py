@@ -6,7 +6,6 @@ import json
 import os
 from pathlib import Path
 from telethon import TelegramClient
-from message_watch import MessageWatch
 
 STATE = Path(__file__).resolve().parent / "state"
 
@@ -43,30 +42,12 @@ async def setup():
 
 async def run():
     state_dir()
-    config = json.loads((STATE / "config.json").read_text())
-    client = TelegramClient(str(STATE / "account"), config["api_id"], config["api_hash"])
-    watch = None
-    worker = None
+    from archive_runner import DeadlineWatchdog, run as run_archive
+    watchdog = DeadlineWatchdog()
     try:
-        await client.connect()
-        if not await client.is_user_authorized():
-            raise RuntimeError("Session unauthorized; perform fresh setup")
-        me = await client.get_me()
-        if me.id != config["owner_id"] or me.bot:
-            raise RuntimeError("Configured owner does not match the signed-in account")
-        watch = MessageWatch(STATE, me.id, config["bot_token"])
-        worker = watch.install(client)
-        print("Watching incoming private chats. Press Ctrl+C to stop.", flush=True)
-        done, _ = await asyncio.wait([worker, client.disconnected], return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            task.result()
+        await run_archive(STATE, watchdog)
     finally:
-        if worker:
-            worker.cancel()
-            await asyncio.gather(worker, return_exceptions=True)
-        await client.disconnect()
-        if watch:
-            watch.close(client)
+        watchdog.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Telegram private-chat edit/delete alerts")

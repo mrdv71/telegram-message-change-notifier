@@ -6,7 +6,14 @@ import sqlite3
 import urllib.request
 import aiohttp
 from pathlib import Path
+from datetime import datetime, timezone
 from telethon import events
+
+
+def is_ephemeral(msg):
+    return bool(getattr(msg, 'ttl_period', None)
+                or getattr(getattr(msg, 'media', None), 'ttl_seconds', None)
+                or getattr(getattr(msg, 'media', None), 'view_once', False))
 
 
 class MessageWatch:
@@ -23,6 +30,8 @@ class MessageWatch:
             if column.split()[0] not in [r[1] for r in self.db.execute(f'PRAGMA table_info({table})')]:
                 self.db.execute(f'ALTER TABLE {table} ADD COLUMN {column}')
         self.db.execute('CREATE TABLE IF NOT EXISTS media (key TEXT PRIMARY KEY, chat INTEGER, msg INTEGER, path TEXT, status TEXT, attempts INTEGER DEFAULT 0)')
+        self.db.execute("CREATE TABLE IF NOT EXISTS upload_spool (key TEXT PRIMARY KEY, path TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'queued', uploaded_at TEXT)")
+        self.spool_root = state / 'upload-spool'
         self.db.commit()
         self.media_dir = state / 'message-media'
         self.media_dir.mkdir(mode=0o700, exist_ok=True)
@@ -58,10 +67,30 @@ class MessageWatch:
 
     async def record(self, event, edited=False):
         msg = event.message
+        if is_ephemeral(msg):
+            return
         if (not event.is_private or msg.out or not msg.sender_id
                 or msg.sender_id == self.owner_id or msg.chat_id != msg.sender_id):
             return
-        sender = await event.get_sender()
+        # Use an already-resolved entity first; a flaky lookup must not lose
+        # an event whose sender identity is already known locally.
+        sender = getattr(event, 'sender', None)
+        if sender is None:
+            try:
+                sender = await asyncio.wait_for(event.get_sender(), 10)
+            except Exception as exc:
+                cached = self.db.execute('SELECT sender FROM messages WHERE chat=? ORDER BY id DESC LIMIT 1',
+                                         (msg.chat_id,)).fetchone()
+                if cached:
+                    from types import SimpleNamespace
+                    # This chat was previously admitted by the human-only filter.
+                    sender = SimpleNamespace(first_name=cached[0], bot=False)
+                else:
+                    with self.db:
+                        self.db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES ('last_unresolved_sender_utc',?)",
+                                        (datetime.now(timezone.utc).isoformat(),))
+                    print('Message watch: sender unresolved; event not archived:', type(exc).__name__, flush=True)
+                    return
         if sender is None or getattr(sender, 'bot', False):
             return
         label = await self.sender_label(sender, msg.sender_id if getattr(sender, 'min', False) or not getattr(sender, 'first_name', None) else None)
@@ -84,6 +113,8 @@ class MessageWatch:
                     self.enqueue_media(key, f'Yangi fayl — {label}')
             self.db.execute('INSERT INTO messages(id,chat,sender,text,media_key) VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET sender=excluded.sender,text=excluded.text,media_key=excluded.media_key',
                             (msg.id, msg.chat_id, label, body, key))
+            self.db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES ('last_record_utc',?)",
+                            (datetime.now(timezone.utc).isoformat(),))
 
     async def deleted(self, event):
         # Non-channel private message IDs share the account's ID namespace.
@@ -100,6 +131,8 @@ class MessageWatch:
                     if changed:
                         self.enqueue(f'🗑 Xabar o‘chirildi\n{label}\n\n{row[1]}')
                         self.enqueue_media(row[2], f'O‘chirilgan fayl — {label}')
+                        self.db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES ('last_deletion_utc',?)",
+                                        (datetime.now(timezone.utc).isoformat(),))
 
     def send(self, text):
         payload = json.dumps({'chat_id': self.owner_id, 'text': text}).encode()
@@ -121,7 +154,7 @@ class MessageWatch:
                 if msg is None:
                     msg = await asyncio.wait_for(client.get_messages(chat, ids=ident), 30)
                 attachment = (getattr(msg, 'photo', None) or getattr(msg, 'document', None)) if msg else None
-                if not attachment or key != f'{chat}_{ident}_{attachment.id}':
+                if is_ephemeral(msg) or not attachment or key != f'{chat}_{ident}_{attachment.id}':
                     raise ValueError('Original media is no longer available')
                 folder = self.media_dir / key
                 folder.mkdir(mode=0o700, exist_ok=True)
@@ -159,15 +192,41 @@ class MessageWatch:
                         if response.status == 413 or (response.status == 400 and 'too big' in result.get('description','').lower()):
                             return False
                         raise RuntimeError('Bot file delivery rejected')
+                    message = result.get('result', {})
+                    if (not message.get('message_id') or not message.get('document')
+                            or message.get('chat', {}).get('id') != self.owner_id):
+                        raise RuntimeError('Bot file acknowledgement incomplete')
         return True
+
+    def cleanup_spool(self):
+        root = self.spool_root.resolve()
+        for key, name in self.db.execute("SELECT key,path FROM upload_spool WHERE state='uploaded'").fetchall():
+            path = Path(name)
+            try:
+                if (not key.startswith('upload:') or path.is_symlink()
+                        or not path.resolve().is_relative_to(root) or path.resolve() == root):
+                    continue
+                path.unlink(missing_ok=True)
+                with self.db:
+                    self.db.execute("UPDATE upload_spool SET state='cleaned' WHERE key=?", (key,))
+                    self.db.execute("UPDATE media SET status='delivered',path=NULL WHERE key=?", (key,))
+                if path.parent != root:
+                    try:
+                        path.parent.rmdir()
+                    except OSError:
+                        pass
+            except OSError:
+                print('Message watch: temporary upload cleanup will retry.', flush=True)
 
     async def deliver(self):
         while True:
+            self.cleanup_spool()
             row = self.db.execute('SELECT id,text,media_key FROM outbox ORDER BY id LIMIT 1').fetchone()
             if not row:
                 await asyncio.sleep(2)
                 continue
             try:
+                uploaded = False
                 if row[2]:
                     media = self.db.execute('SELECT path,status FROM media WHERE key=?', (row[2],)).fetchone()
                     if media and media[1] == 'pending':
@@ -179,10 +238,16 @@ class MessageWatch:
                         await asyncio.to_thread(self.send, row[1] + '\n📁 Katta fayl kompyuterda saqlandi; bot yuklash chegarasi sabab yuborilmadi.\n' + media[0])
                     elif not await self.send_file(media[0], row[1]):
                         await asyncio.to_thread(self.send, row[1] + '\n📁 Fayl kompyuterda saqlandi; Telegram yuklashni rad etdi.\n' + media[0])
+                    else:
+                        uploaded = True
                 else:
                     await asyncio.to_thread(self.send, row[1])
                 with self.db:
+                    self.db.execute("UPDATE upload_spool SET state=?,uploaded_at=? WHERE key=?",
+                                    ('uploaded' if uploaded else 'retained',
+                                     datetime.now(timezone.utc).isoformat() if uploaded else None, row[2]))
                     self.db.execute('DELETE FROM outbox WHERE id=?', (row[0],))
+                self.cleanup_spool()
                 print('Message watch: notification delivered.', flush=True)
                 await asyncio.sleep(1)
             except Exception as exc:
@@ -190,19 +255,24 @@ class MessageWatch:
                 print('Message watch delivery retry:', type(exc).__name__, flush=True)
                 await asyncio.sleep(30)
 
-    def install(self, client):
+    def install(self, client, ready=None):
         self.client = client
-        # Sender lookups yield to the event loop. Serialize mutations so a
-        # slower original cannot overwrite a later edit or miss a deletion.
+        if ready is None:
+            ready = asyncio.Event()
+            ready.set()
+        # All three mutations share one lock before any yielding lookup.
         event_lock = asyncio.Lock()
         async def new(event):
             async with event_lock:
+                await ready.wait()
                 await self.record(event)
         async def edit(event):
             async with event_lock:
+                await ready.wait()
                 await self.record(event, edited=True)
         async def deleted(event):
             async with event_lock:
+                await ready.wait()
                 await self.deleted(event)
         for callback, kind in [(new, events.NewMessage(incoming=True)),
                                (edit, events.MessageEdited(incoming=True)),
@@ -211,13 +281,14 @@ class MessageWatch:
             self.handlers.append(callback)
         with self.db:
             if not self.db.execute("SELECT 1 FROM settings WHERE key='announced'").fetchone():
-                self.enqueue('✅ Shaxsiy xabarlar kuzatuvi yoqildi. Endi kuzatuvga tushgan xabar o‘chirilsa yoki tahrirlansa, shu bot orqali bildirishnoma keladi. Matn, caption va mavjud media fayllari saqlanadi. Kompyuter uyg‘oq va internetga ulangan bo‘lishi kerak.')
+                self.enqueue('✅ Shaxsiy xabarlar kuzatuvi yoqildi. Endi kuzatuvga tushgan xabar o‘chirilsa yoki tahrirlansa, shu bot orqali bildirishnoma keladi. Matn, caption va mavjud oddiy media fayllari saqlanadi. Kompyuter uyg‘oq va internetga ulangan bo‘lishi kerak.')
                 self.db.execute("INSERT INTO settings VALUES ('announced','1')")
             if not self.db.execute("SELECT 1 FROM settings WHERE key='media_announced'").fetchone():
                 self.enqueue('✅ Media kuzatuvi yoqildi: rasm, video, audio, ovozli xabar va hujjatlar kelganda kompyuterda saqlanadi. O‘chirilsa yoki tahrirlansa, saqlangan fayl shu botga yuboriladi. Katta fayllar faqat kompyuterda qolishi mumkin.')
                 self.db.execute("INSERT INTO settings VALUES ('media_announced','1')")
         print('Message watch: private incoming text and media handlers ready.', flush=True)
         async def supervise():
+            await ready.wait()
             tasks = [asyncio.create_task(self.deliver()), asyncio.create_task(self.download_media(client))]
             try:
                 done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -233,5 +304,3 @@ class MessageWatch:
         for callback in self.handlers:
             client.remove_event_handler(callback)
         self.db.close()
-
-

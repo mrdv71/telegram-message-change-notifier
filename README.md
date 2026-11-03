@@ -112,8 +112,8 @@ Windows instructions are provided but Windows operation has not been verified. O
 
 - The computer must remain awake, online, and the command must keep running. The basic command installs no background service; DEPLOYMENT.md provides an optional Linux systemd service. Ctrl+C stops it without logging out.
 - Only observed/cached originals can be reported. Already-deleted content cannot be recovered. An edit first observed without a cached original explicitly reports that the old content is unavailable.
-- Secret Chats are unsupported. There is no startup history backfill or guaranteed offline edit/delete recovery.
-- Media can disappear before download completes; failed/missing originals are labeled accordingly. No guarantee of saving every disappearing item.
+- Secret Chats are unsupported. Startup requests persisted-update catch-up after account verification; this is not history backfill or guaranteed offline edit/delete recovery.
+- Media can disappear before download completes; failed/missing originals are labeled accordingly. TTL, view-once and expiring messages are intentionally excluded.
 - Files above the conservative 49 MiB bot-upload threshold remain local and generate a location notice. Telegram may impose other restrictions. Attachments are sent as documents, not native voice bubbles.
 - Delivery retries persist, but a crash after Telegram accepts a notification can produce a duplicate.
 - The cache stores the latest message text, retained attachment versions, and pending alerts—not a complete permanent text-version timeline.
@@ -138,3 +138,20 @@ On Mac/Linux, from the repository folder:
 ```
 
 Tests include ordered overlapping arrival/edit/delete events and long Unicode notification splitting. Tests use temporary databases and generated dummy media; they do not log in or send real Telegram messages. Live account capture, live bot delivery, reboot and sleep/wake behavior must be verified separately in your own setup.
+
+## Reliability and optional upload queue
+
+Startup, health RPCs and shutdown have bounded deadlines. A separate watchdog exits a
+stuck process so an external supervisor can restart it; the foreground command does
+not restart itself. Events wait for account verification and share an ordering lock.
+Sender lookup failures can reuse previously admitted human identities. Private health
+status is written inside the configured state directory. Run only one instance per
+state directory; no portable process lock is installed by this source edition.
+
+Bot document delivery requires a complete acknowledgement for the configured owner.
+Optional temporary uploads use the local `upload_spool` SQLite table and `upload:`
+media keys; only explicitly registered files inside `state/upload-spool/` are eligible
+for cleanup, and only after successful document acknowledgement. Failed, oversized,
+or unmarked ordinary archived files remain local. Symlinks and outside paths are not
+removed. No external spool producer or disappearing-media collector is included or
+automatically connected; the ordinary edit/delete archive works independently.

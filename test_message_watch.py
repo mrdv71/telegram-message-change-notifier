@@ -36,7 +36,7 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         await self.w.record(Event())
         await self.w.deleted(S(chat_id=None,deleted_ids=[1]))
         class Client:
-            async def download_media(self,msg,file):
+            async def download_media(self,msg,file,progress_callback=None):
                 p=Path(file+'.ogg');p.write_bytes(b'test-audio');return str(p)
         task=asyncio.create_task(self.w.download_media(Client()))
         for _ in range(100):

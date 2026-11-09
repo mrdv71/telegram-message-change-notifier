@@ -155,3 +155,54 @@ for cleanup, and only after successful document acknowledgement. Failed, oversiz
 or unmarked ordinary archived files remain local. Symlinks and outside paths are not
 removed. No external spool producer or disappearing-media collector is included or
 automatically connected; the ordinary edit/delete archive works independently.
+
+
+## Resource limits and retry recovery
+
+Requires Python 3.10+ (3.12 recommended). Python 3.9 cannot satisfy the current
+manifest: rebuild its virtual environment with Python 3.12, do not lower dependency
+requirements to fit an obsolete interpreter.
+
+Optional limits.json in the private state directory overrides these positive integer
+defaults (unknown names, zero, negative or non-integer values abort startup):
+
+| Key | Default | Meaning |
+| --- | ---: | --- |
+| file_bytes | 51380224 | 49 MiB maximum ordinary-media download |
+| archive_bytes | 10737418240 | 10 GiB total private state, including partial files |
+| free_bytes | 1073741824 | Keep at least 1 GiB filesystem free space |
+| queue_items | 5000 | Combined pending media, outbox and dead-letter budget |
+| sender_events | 60 | Maximum admitted message/edit/delete events per sender window |
+| sender_window | 60 | Window duration in seconds; persisted across restarts |
+| delivery_attempts | 5 | Failed delivery attempts before preservation in dead-letter |
+
+Restart to apply changes. Quotas stop admitting new work; **no existing message,
+ordinary attachment, session or dead-letter is automatically purged**. Events refused
+at admission are not backfilled. Existing archives larger than the limit remain
+untouched but new admissions stop. Review capacity and increase limits explicitly,
+or move/back up data manually while stopped. Do not delete the account session.
+A private-state scan is used for capacity checks; very large file counts can reduce
+throughput. These are application bounds, not a filesystem quota: SQLite page growth,
+concurrent external writers and one download chunk may briefly overshoot a boundary.
+Use an OS/filesystem quota for a hard disk guarantee. Unknown-size downloads are checked
+as chunks arrive; interrupted partial downloads are retained and count toward quota.
+
+Transient failures use persisted exponential backoff (30 seconds up to one hour).
+A failed item is deferred so other ready items can proceed; pending attachments likewise
+no longer block unrelated text alerts. Telegram 429 retry_after pauses the whole bot
+queue and survives restart. After the configured failed attempts, text/media references
+move atomically into private SQLite table delivery_dead_letter; original media stays.
+Dead-letter entries count against the queue budget. There is no automatic replay/purge:
+stop the collector, back up the database, inspect failures privately, fix the cause,
+then have an operator explicitly requeue selected items. Replays may duplicate a message
+if Telegram accepted an earlier request before the response was lost. No test command
+sends live Telegram messages.
+
+The additive schema migration keeps existing message/outbox rows and media. Back up
+state while stopped before deploying. Never replace a different collector wholesale:
+installations with custom spool/receipt integrations need a reviewed integration plan.
+
+Review [migration gates](MIGRATION.md) before upgrading a custom collector.
+At a queue boundary, an edit/delete and its alerts are admitted atomically;
+otherwise the prior cached message is retained. Partial download attempts use
+unique names and remain counted against storage; retries never overwrite them.
